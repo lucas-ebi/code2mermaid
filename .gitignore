@@ -1,0 +1,11 @@
+# Ignore egg-info directory (created by pip install -e .)
+*.egg-info/
+code2mermaid.egg-info/
+
+# Ignore compiled bytecode
+__pycache__/
+*.py[cod]
+
+# (Optional) If you also want to ignore build/dist artifacts:
+build/
+dist/
