@@ -156,6 +156,8 @@ class FlowchartGenerator(ast.NodeVisitor):
             return self._handle_raise(node)
         elif isinstance(node, ast.Pass):
             return self._handle_pass(node)
+        elif isinstance(node, ast.With):
+            return self._handle_with(node)
         else:
             # fallback
             dump_str = ast.dump(node)
@@ -397,6 +399,31 @@ class FlowchartGenerator(ast.NodeVisitor):
     def _handle_pass(self, node: ast.Pass):
         p_id = self._new_node("process", "pass")
         return (p_id, p_id)
+
+    def _handle_with(self, with_node: ast.With):
+        # Build a label from the context expressions in the 'with' statement.
+        # Each item is an ast.withitem, which has a 'context_expr' and optionally 'optional_vars'.
+        item_strs = []
+        for item in with_node.items:
+            context_expr = ast.unparse(item.context_expr)
+            if item.optional_vars:
+                var_str = ast.unparse(item.optional_vars)
+                item_strs.append(f"{context_expr} as {var_str}")
+            else:
+                item_strs.append(context_expr)
+        label = "With " + ", ".join(item_strs)
+
+        # Create a single node for the 'with' statement
+        with_id = self._new_node("process", label)
+
+        # Build the sub-flow for the 'with' body
+        body_first, body_last = self._build_block(with_node.body)
+
+        # Link the 'with' node to the first statement in the body
+        self._link(with_id, body_first)
+
+        # Return the entry node ('with' node) and the last node in its body
+        return (with_id, body_last)
 
 #
 # A helper to parse code and generate the flowchart
