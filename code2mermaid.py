@@ -7,7 +7,8 @@ class FlowchartGenerator(ast.NodeVisitor):
     """
     A flowchart generator that ensures each decision node
     has exactly two outflows (Yes/No) and merges the branches
-    back together. Also handles try/except, returns, breaks, etc.
+    back together. Also handles try/except, returns, breaks, etc.,
+    including loop-else clauses.
 
     This version replaces problematic characters like { } [ ] "
     with HTML entities to avoid Mermaid parse issues.
@@ -29,17 +30,6 @@ class FlowchartGenerator(ast.NodeVisitor):
         """
         Convert special characters into HTML entities so that Mermaid
         doesn't parse them as shape syntax or string terminators.
-
-        For instance:
-          {  -> &#123;
-          }  -> &#125;
-          [  -> &#91;
-          ]  -> &#93;
-          "  -> &quot;
-          &  -> &amp;   (helpful if your code includes ampersands)
-          <  -> &lt;    (if your code might have angle brackets)
-          >  -> &gt;    (same reason)
-        You can add or remove from this list as needed.
         """
         replacements = {
             "&":  "&amp;",
@@ -85,6 +75,8 @@ class FlowchartGenerator(ast.NodeVisitor):
         Create an edge: src --> dest
         or if label is "Yes"/"No", src -- Yes --> dest
         """
+        if dest is None:
+            return  # No link if destination is None
         if label in ("Yes", "No"):
             self.edges.append(f"{src} -- {label} --> {dest}")
         else:
@@ -122,8 +114,12 @@ class FlowchartGenerator(ast.NodeVisitor):
         for stmt in func_node.body:
             first_node, last_node = self._build_flow(stmt)
             self._link(prev_node, first_node)
+            if last_node is None:
+                # short-circuit
+                break
             prev_node = last_node
 
+        # If flow never short-circuited, link to function end
         self._link(prev_node, end_id)
 
         self.current_function_end = saved_end
@@ -174,13 +170,15 @@ class FlowchartGenerator(ast.NodeVisitor):
         first_node, last_node = self._build_flow(stmts[0])
         prev = last_node
         for stmt in stmts[1:]:
+            if prev is None:
+                break  # short-circuited
             stmt_first, stmt_last = self._build_flow(stmt)
             self._link(prev, stmt_first)
             prev = stmt_last
         return (first_node, prev)
 
     #
-    # == Handlers for Each Statement ==
+    # == Statement Handlers ==
     #
     def _handle_try(self, node: ast.Try):
         try_id = self._new_node("process", "Try")
@@ -194,7 +192,7 @@ class FlowchartGenerator(ast.NodeVisitor):
             self._link(try_id, dummy_try)
             last_try = dummy_try
 
-        normal_end_nodes = [last_try]
+        normal_end_nodes = [last_try] if last_try is not None else []
 
         # Except handlers
         except_end_nodes = []
@@ -210,7 +208,8 @@ class FlowchartGenerator(ast.NodeVisitor):
             self._link(try_id, except_id, label="Exception?")
             first_exc, last_exc = self._build_block(handler.body)
             self._link(except_id, first_exc)
-            except_end_nodes.append(last_exc)
+            if last_exc is not None:
+                except_end_nodes.append(last_exc)
 
         # Else
         else_end_node = None
@@ -222,7 +221,7 @@ class FlowchartGenerator(ast.NodeVisitor):
             self._link(else_id, first_else)
             else_end_node = last_else
         else:
-            else_end_node = None
+            else_end_node = normal_end_nodes[0] if normal_end_nodes else None
 
         # Finally
         finally_end_node = None
@@ -242,12 +241,11 @@ class FlowchartGenerator(ast.NodeVisitor):
             self._link(fin_id, first_fin)
             finally_end_node = last_fin
 
-        # subflow first/last
         subflow_first = try_id
         if node.finalbody:
             subflow_last = finally_end_node
         else:
-            subflow_last = else_end_node if else_end_node else last_try
+            subflow_last = else_end_node
 
         return (subflow_first, subflow_last)
 
@@ -256,10 +254,10 @@ class FlowchartGenerator(ast.NodeVisitor):
         value_str  = ast.unparse(node.value)
         label = f"{target_str} = {value_str}"
 
-        if (isinstance(node.value, ast.Call) and
-            isinstance(node.value.func, ast.Name) and
-            node.value.func.id == "input"):
-            # input => I/O shape
+        # If it's input() => use I/O shape
+        if (isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "input"):
             nid = self._new_node("input_output", label)
         else:
             nid = self._new_node("process", label)
@@ -268,22 +266,26 @@ class FlowchartGenerator(ast.NodeVisitor):
     def _handle_if(self, if_node: ast.If):
         cond_id = self._new_node("decision", f"If {ast.unparse(if_node.test)}?")
 
-        # If-body
-        if_body_first, if_body_last = (
-            self._build_block(if_node.body) if if_node.body else self._make_pass()
-        )
+        # If body
+        if if_node.body:
+            if_body_first, if_body_last = self._build_block(if_node.body)
+        else:
+            if_body_first, if_body_last = self._make_pass()
         self._link(cond_id, if_body_first, label="Yes")
 
-        # Else-body
-        else_body_first, else_body_last = (
-            self._build_block(if_node.orelse) if if_node.orelse else self._make_pass()
-        )
+        # Else body
+        if if_node.orelse:
+            else_body_first, else_body_last = self._build_block(if_node.orelse)
+        else:
+            else_body_first, else_body_last = self._make_pass()
         self._link(cond_id, else_body_first, label="No")
 
-        # Merge node
+        # Merge
         merge_id = self._new_node("process", "merge")
-        self._link(if_body_last, merge_id)
-        self._link(else_body_last, merge_id)
+        if if_body_last is not None:
+            self._link(if_body_last, merge_id)
+        if else_body_last is not None:
+            self._link(else_body_last, merge_id)
 
         return (cond_id, merge_id)
 
@@ -292,39 +294,75 @@ class FlowchartGenerator(ast.NodeVisitor):
         return (n, n)
 
     def _handle_for(self, for_node: ast.For):
+        """
+        Handle a 'for' loop, including optional else-block,
+        with exactly two arrows from the diamond:
+          - Yes => loop body
+          - No => either else-block or merge node
+        """
         cond_label = f"For {ast.unparse(for_node.target)} in {ast.unparse(for_node.iter)}?"
         cond_id = self._new_node("decision", cond_label)
-
         merge_id = self._new_node("process", "for-merge")
+
+        # Push loop context so 'break' goes to merge_id, 'continue' goes to cond_id
         self.loop_stack.append((cond_id, merge_id))
 
+        # Build the loop body
         if for_node.body:
-            first_body, last_body = self._build_block(for_node.body)
+            body_first, body_last = self._build_block(for_node.body)
         else:
-            first_body, last_body = self._make_pass()
+            body_first, body_last = self._make_pass()
 
-        self._link(cond_id, first_body, label="Yes")
-        self._link(last_body, cond_id)
-        self._link(cond_id, merge_id, label="No")
+        # Link diamond => body, body => diamond
+        self._link(cond_id, body_first, label="Yes")
+        self._link(body_last, cond_id)
+
+        # Build the else block (if any) from the diamond's No edge
+        if for_node.orelse:
+            else_first, else_last = self._build_block(for_node.orelse)
+            self._link(cond_id, else_first, label="No")
+            # Then link the end of else block to the merge
+            if else_last is not None:
+                self._link(else_last, merge_id)
+        else:
+            # If no else block, go straight to merge on No
+            self._link(cond_id, merge_id, label="No")
 
         self.loop_stack.pop()
         return (cond_id, merge_id)
 
     def _handle_while(self, while_node: ast.While):
+        """
+        Handle a 'while' loop, including optional else-block,
+        with exactly two arrows from the diamond:
+          - Yes => loop body
+          - No => either else-block or merge node
+        """
         cond_label = f"While {ast.unparse(while_node.test)}?"
         cond_id = self._new_node("decision", cond_label)
-
         merge_id = self._new_node("process", "while-merge")
+
+        # Push loop context so 'break' goes to merge_id, 'continue' goes to cond_id
         self.loop_stack.append((cond_id, merge_id))
 
+        # Build the loop body
         if while_node.body:
-            first_body, last_body = self._build_block(while_node.body)
+            body_first, body_last = self._build_block(while_node.body)
         else:
-            first_body, last_body = self._make_pass()
+            body_first, body_last = self._make_pass()
 
-        self._link(cond_id, first_body, label="Yes")
-        self._link(last_body, cond_id)
-        self._link(cond_id, merge_id, label="No")
+        # Link diamond => body, body => diamond
+        self._link(cond_id, body_first, label="Yes")
+        self._link(body_last, cond_id)
+
+        # Build the else block
+        if while_node.orelse:
+            else_first, else_last = self._build_block(while_node.orelse)
+            self._link(cond_id, else_first, label="No")
+            if else_last is not None:
+                self._link(else_last, merge_id)
+        else:
+            self._link(cond_id, merge_id, label="No")
 
         self.loop_stack.pop()
         return (cond_id, merge_id)
@@ -357,34 +395,43 @@ class FlowchartGenerator(ast.NodeVisitor):
         for stmt in func_node.body:
             f1, f2 = self._build_flow(stmt)
             self._link(prev, f1)
+            if f2 is None:
+                break
             prev = f2
         self._link(prev, end_id)
 
         self.current_function_end = saved_end
         return (top_id, top_id)
 
+    #
+    # == Short-Circuit Handlers (return/break/continue/raise) ==
+    #
     def _handle_return(self, node: ast.Return):
         label = "Return"
         if node.value:
             label += f" {ast.unparse(node.value)}"
         r_id = self._new_node("process", label)
+
+        # Link to function end if known
         if self.current_function_end:
             self._link(r_id, self.current_function_end)
-        return (r_id, r_id)
+
+        # short-circuit
+        return (r_id, None)
 
     def _handle_break(self, node: ast.Break):
         b_id = self._new_node("process", "break")
         if self.loop_stack:
             cond_node, merge_node = self.loop_stack[-1]
-            self._link(b_id, merge_node)
-        return (b_id, b_id)
+            self._link(b_id, merge_node)  # jump to loop merge
+        return (b_id, None)
 
     def _handle_continue(self, node: ast.Continue):
         c_id = self._new_node("process", "continue")
         if self.loop_stack:
             cond_node, merge_node = self.loop_stack[-1]
-            self._link(c_id, cond_node)
-        return (c_id, c_id)
+            self._link(c_id, cond_node)  # jump back to condition
+        return (c_id, None)
 
     def _handle_raise(self, node: ast.Raise):
         if node.exc:
@@ -392,7 +439,7 @@ class FlowchartGenerator(ast.NodeVisitor):
         else:
             label = "Raise"
         r_id = self._new_node("process", label)
-        return (r_id, r_id)
+        return (r_id, None)
 
     def _handle_pass(self, node: ast.Pass):
         p_id = self._new_node("process", "pass")
@@ -412,12 +459,9 @@ def generate_flowchart_from_code(code: str) -> str:
 #
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate a structured Mermaid flowchart, converting { } [ ] & \" into HTML entities to avoid parse errors."
+        description="Generate a structured Mermaid flowchart, converting special characters into HTML entities."
     )
-    parser.add_argument(
-        "source_file",
-        help="Path to the Python source file."
-    )
+    parser.add_argument("source_file", help="Path to the Python source file.")
     parser.add_argument(
         "-o", "--output",
         default=None,
